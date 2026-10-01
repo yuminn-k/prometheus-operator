@@ -738,6 +738,82 @@ func testProbeStatusSubresource(t *testing.T) {
 	require.Equal(t, ts, cond.LastTransitionTime.String())
 }
 
+func testProbeStatusSubresourceForPrometheusAgent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	testCtx := framework.NewTestCtx(t)
+	defer testCtx.Cleanup(t)
+
+	ns := framework.CreateNamespace(ctx, t, testCtx)
+	framework.SetupPrometheusRBAC(ctx, t, testCtx, ns)
+	_, err := framework.CreateOrUpdatePrometheusOperatorWithOpts(
+		ctx, testFramework.PrometheusOperatorOpts{
+			Namespace:           ns,
+			AllowedNamespaces:   []string{ns},
+			EnabledFeatureGates: []operator.FeatureGateName{operator.StatusForConfigurationResourcesFeature},
+		},
+	)
+	require.NoError(t, err)
+
+	name := "probe-status-agent-test"
+	p := framework.MakeBasicPrometheusAgent(ns, name, name, 1)
+	p.Spec.ProbeSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"group": name}}
+	p, err = framework.CreatePrometheusAgentAndWaitUntilReady(ctx, ns, p)
+	require.NoError(t, err)
+
+	probe1 := framework.MakeBasicStaticProbe("probe1", "localhost:9115", []string{"example.com"})
+	probe1.Labels["group"] = name
+	probe1, err = framework.MonClientV1.Probes(ns).Create(ctx, probe1, metav1.CreateOptions{})
+	require.NoError(t, err)
+	probe1, err = framework.WaitForProbeCondition(ctx, probe1, p, monitoringv1alpha1.PrometheusAgentName, monitoringv1.Accepted, monitoringv1.ConditionTrue, time.Minute)
+	require.NoError(t, err)
+	binding, err := framework.GetWorkloadBinding(probe1.Status.Bindings, p, monitoringv1alpha1.PrometheusAgentName)
+	require.NoError(t, err)
+	cond, err := framework.GetConfigResourceCondition(binding.Conditions, monitoringv1.Accepted)
+	require.NoError(t, err)
+	ts := cond.LastTransitionTime.String()
+	require.NotEmpty(t, ts)
+
+	probe2 := framework.MakeBasicStaticProbe("probe2", "localhost:9115", []string{"example.com"})
+	probe2.Labels["group"] = name
+	probe2, err = framework.MonClientV1.Probes(ns).Create(ctx, probe2, metav1.CreateOptions{})
+	require.NoError(t, err)
+	probe2, err = framework.WaitForProbeCondition(ctx, probe2, p, monitoringv1alpha1.PrometheusAgentName, monitoringv1.Accepted, monitoringv1.ConditionTrue, time.Minute)
+	require.NoError(t, err)
+
+	probe1.Labels["test"] = "test"
+	probe1, err = framework.MonClientV1.Probes(ns).Update(ctx, probe1, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	probe2.Spec.BasicAuth = &monitoringv1.BasicAuth{
+		Username: corev1.SecretKeySelector{
+			Key: "username",
+			LocalObjectReference: corev1.LocalObjectReference{
+				Name: name,
+			},
+		},
+	}
+	probe2, err = framework.MonClientV1.Probes(ns).Update(ctx, probe2, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	probe2, err = framework.WaitForProbeCondition(ctx, probe2, p, monitoringv1alpha1.PrometheusAgentName, monitoringv1.Accepted, monitoringv1.ConditionFalse, time.Minute)
+	require.NoError(t, err)
+	binding, err = framework.GetWorkloadBinding(probe2.Status.Bindings, p, monitoringv1alpha1.PrometheusAgentName)
+	require.NoError(t, err)
+	cond, err = framework.GetConfigResourceCondition(binding.Conditions, monitoringv1.Accepted)
+	require.NoError(t, err)
+	require.Equal(t, operator.InvalidConfiguration, cond.Reason)
+	require.NotEmpty(t, cond.Message)
+	require.Equal(t, probe2.Generation, cond.ObservedGeneration)
+
+	probe1, err = framework.WaitForProbeCondition(ctx, probe1, p, monitoringv1alpha1.PrometheusAgentName, monitoringv1.Accepted, monitoringv1.ConditionTrue, time.Minute)
+	require.NoError(t, err)
+	binding, err = framework.GetWorkloadBinding(probe1.Status.Bindings, p, monitoringv1alpha1.PrometheusAgentName)
+	require.NoError(t, err)
+	cond, err = framework.GetConfigResourceCondition(binding.Conditions, monitoringv1.Accepted)
+	require.NoError(t, err)
+	require.Equal(t, ts, cond.LastTransitionTime.String())
+}
+
 // testGarbageCollectionOfPodMonitorBinding validates that the operator removes the reference to the Prometheus resource when the PodMonitor isn't selected anymore by the workload.
 func testGarbageCollectionOfPodMonitorBinding(t *testing.T) {
 	t.Parallel()
@@ -1212,6 +1288,77 @@ func testRmProbeBindingDuringWorkloadDelete(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = framework.WaitForProbeWorkloadBindingCleanup(ctx, probe, p, monitoringv1.PrometheusName, 1*time.Minute)
+	require.NoError(t, err)
+}
+
+func testGarbageCollectionOfProbeBindingForPrometheusAgent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	testCtx := framework.NewTestCtx(t)
+	defer testCtx.Cleanup(t)
+
+	ns := framework.CreateNamespace(ctx, t, testCtx)
+	framework.SetupPrometheusRBAC(ctx, t, testCtx, ns)
+	_, err := framework.CreateOrUpdatePrometheusOperatorWithOpts(
+		ctx, testFramework.PrometheusOperatorOpts{
+			Namespace:           ns,
+			AllowedNamespaces:   []string{ns},
+			EnabledFeatureGates: []operator.FeatureGateName{operator.StatusForConfigurationResourcesFeature},
+		},
+	)
+	require.NoError(t, err)
+
+	name := "probe-agent-binding-cleanup-test"
+	p := framework.MakeBasicPrometheusAgent(ns, name, name, 1)
+	p.Spec.ProbeSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"group": name}}
+	p, err = framework.CreatePrometheusAgentAndWaitUntilReady(ctx, ns, p)
+	require.NoError(t, err)
+
+	probe := framework.MakeBasicStaticProbe(name, "localhost:9115", []string{"example.com"})
+	probe, err = framework.MonClientV1.Probes(ns).Create(ctx, probe, metav1.CreateOptions{})
+	require.NoError(t, err)
+	probe, err = framework.WaitForProbeCondition(ctx, probe, p, monitoringv1alpha1.PrometheusAgentName, monitoringv1.Accepted, monitoringv1.ConditionTrue, time.Minute)
+	require.NoError(t, err)
+
+	probe.Labels = map[string]string{}
+	probe, err = framework.MonClientV1.Probes(ns).Update(ctx, probe, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	_, err = framework.WaitForProbeWorkloadBindingCleanup(ctx, probe, p, monitoringv1alpha1.PrometheusAgentName, time.Minute)
+	require.NoError(t, err)
+}
+
+func testRmProbeBindingDuringPrometheusAgentDelete(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	testCtx := framework.NewTestCtx(t)
+	defer testCtx.Cleanup(t)
+
+	ns := framework.CreateNamespace(ctx, t, testCtx)
+	framework.SetupPrometheusRBAC(ctx, t, testCtx, ns)
+	_, err := framework.CreateOrUpdatePrometheusOperatorWithOpts(
+		ctx, testFramework.PrometheusOperatorOpts{
+			Namespace:           ns,
+			AllowedNamespaces:   []string{ns},
+			EnabledFeatureGates: []operator.FeatureGateName{operator.StatusForConfigurationResourcesFeature},
+		},
+	)
+	require.NoError(t, err)
+
+	name := "agent-delete-probe-test"
+	p := framework.MakeBasicPrometheusAgent(ns, name, name, 1)
+	p.Spec.ProbeSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"group": name}}
+	p, err = framework.CreatePrometheusAgentAndWaitUntilReady(ctx, ns, p)
+	require.NoError(t, err)
+
+	probe := framework.MakeBasicStaticProbe(name, "localhost:9115", []string{"example.com"})
+	probe, err = framework.MonClientV1.Probes(ns).Create(ctx, probe, metav1.CreateOptions{})
+	require.NoError(t, err)
+	probe, err = framework.WaitForProbeCondition(ctx, probe, p, monitoringv1alpha1.PrometheusAgentName, monitoringv1.Accepted, monitoringv1.ConditionTrue, time.Minute)
+	require.NoError(t, err)
+
+	err = framework.DeletePrometheusAgentAndWaitUntilGone(ctx, ns, name)
+	require.NoError(t, err)
+	_, err = framework.WaitForProbeWorkloadBindingCleanup(ctx, probe, p, monitoringv1alpha1.PrometheusAgentName, time.Minute)
 	require.NoError(t, err)
 }
 
